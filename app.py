@@ -1,8 +1,9 @@
-# --- 1. 核心兼容性补丁 ---
+# --- 1. 核心补丁：必须在最顶端，解决 Linux 环境 SQLite 版本问题 ---
+import sys
 try:
-    import pysqlite3
+    __import__('pysqlite3')
     import sys
-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 except ImportError:
     pass
 
@@ -15,7 +16,7 @@ import shutil
 import re
 from datetime import datetime
 
-# --- 2. 基础环境配置 ---
+# --- 2. 基础配置 ---
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -26,52 +27,80 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 
-DB_PATH = "./drug_db"
+# 数据库存储路径 (Streamlit Cloud 建议使用相对路径)
+DB_PATH = "./chroma_db_storage"
 
 # --- 3. 核心逻辑类 ---
 
 class KnowledgeManager:
     def __init__(self, model_name, db_path):
         self.db_path = db_path
+        # 预先加载嵌入模型
         self.embeddings = HuggingFaceEmbeddings(
             model_name=model_name,
             model_kwargs={'device': 'cpu'}
         )
+        self.vectorstore = None
         self.init_db()
 
     def init_db(self):
-        self.vectorstore = Chroma(
-            collection_name="pharmacy_docs",
-            persist_directory=self.db_path,
-            embedding_function=self.embeddings
-        )
+        """初始化数据库，增加异常处理"""
+        try:
+            self.vectorstore = Chroma(
+                collection_name="pharmacy_v1",
+                persist_directory=self.db_path,
+                embedding_function=self.embeddings
+            )
+        except Exception as e:
+            # 如果数据库文件损坏导致初始化失败，尝试删除重建
+            if os.path.exists(self.db_path):
+                shutil.rmtree(self.db_path)
+            os.makedirs(self.db_path, exist_ok=True)
+            self.vectorstore = Chroma(
+                collection_name="pharmacy_v1",
+                persist_directory=self.db_path,
+                embedding_function=self.embeddings
+            )
 
     def upload_docs(self, file_path, file_name):
-        loader = PyPDFLoader(file_path)
-        docs = loader.load()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-        splits = splitter.split_documents(docs)
-        for s in splits:
-            s.metadata["source"] = file_name
-        self.vectorstore.add_documents(splits)
-        return len(splits)
+        """解析 PDF 并存入"""
+        try:
+            loader = PyPDFLoader(file_path)
+            docs = loader.load()
+            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+            splits = splitter.split_documents(docs)
+            
+            # 注入元数据
+            for s in splits:
+                s.metadata["source"] = file_name
+            
+            self.vectorstore.add_documents(splits)
+            return len(splits)
+        except Exception as e:
+            st.error(f"解析文件 {file_name} 失败: {e}")
+            return 0
 
     def retrieve_context(self, query):
-        if not query: return ""
+        if not query or not self.vectorstore: return ""
         try:
             results = self.vectorstore.similarity_search(query, k=5)
             return "\n\n".join([f"【来源：{res.metadata.get('source', '未知')}】\n{res.page_content}" for res in results])
-        except: return ""
+        except Exception as e:
+            return f"检索出错: {e}"
 
     def get_stats(self):
+        """安全地获取已存文件列表"""
         try:
             data = self.vectorstore.get()
-            if not data or 'metadatas' not in data: return []
-            sources = set(m['source'] for m in data['metadatas'] if m and 'source' in m)
+            if not data or 'metadatas' not in data or not data['metadatas']:
+                return []
+            sources = {m['source'] for m in data['metadatas'] if m and 'source' in m}
             return sorted(list(sources))
-        except: return []
+        except:
+            return []
 
     def clear_db(self):
+        """彻底清空数据库目录并重启"""
         if os.path.exists(self.db_path):
             shutil.rmtree(self.db_path)
         os.makedirs(self.db_path, exist_ok=True)
@@ -89,14 +118,11 @@ class PharmacyAgent:
     def audit(self, prescription_json, context):
         system_prompt = """你是一位资深临床药师。请根据【参考资料】审核【处方数据】并给出打分。
         
-        审核要求：
-        1. 评分标准（0-100分）：100分为完全合规安全；60分以下为存在严重风险。
-        2. 结构化输出结果：
-           - [综合评估得分]：仅输出数字（0-100）。
-           - [风险等级]：低/中/高。
-           - [分析详情]：分条目列出适应症、用法用量、特殊人群风险。
-           - [修改建议]：若有问题，请给出具体调整方案。
-        3. 若参考资料不足，请根据常识审核并标注“仅供参考”。"""
+        输出要求：
+        1. [综合评估得分]：0-100（数字）。
+        2. [风险等级]：低/中/高。
+        3. [分析详情]：分点说明。
+        4. [修改建议]：具体的调整方案。"""
         
         prompt = ChatPromptTemplate.from_template(
             system_prompt + "\n\n【参考资料】:\n{context}\n\n【处方数据】:\n{prescription}"
@@ -107,149 +133,107 @@ class PharmacyAgent:
             "prescription": json.dumps(prescription_json, ensure_ascii=False, indent=2)
         }).content
 
-# --- 4. 辅助函数 ---
+# --- 4. 辅助工具 ---
 
 def extract_score(text):
-    """从 AI 文本中提取数字得分"""
     match = re.search(r'综合评估得分[\]：:]*\s*(\d+)', text)
-    if match:
-        return int(match.group(1))
-    return None
+    return int(match.group(1)) if match else None
 
 @st.cache_resource
-def get_km():
+def load_km():
     return KnowledgeManager("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", DB_PATH)
 
 # --- 5. Streamlit UI ---
 
 def main():
     st.set_page_config(page_title="AI 药师审方系统", layout="wide", page_icon="💊")
-    km = get_km()
-
-    # 初始化 session_state
+    
+    # 初始化
+    km = load_km()
     if 'audit_report' not in st.session_state: st.session_state['audit_report'] = ""
     if 'audit_score' not in st.session_state: st.session_state['audit_score'] = None
-    if 'api_key' not in st.session_state: st.session_state['api_key'] = ""
 
     # --- 侧边栏 ---
     with st.sidebar:
         st.title("🔐 系统管理")
-        user_key = st.text_input("DeepSeek API Key:", type="password", value=st.session_state['api_key'])
-        if user_key: st.session_state['api_key'] = user_key
+        api_key = st.text_input("DeepSeek API Key:", type="password")
         
         st.divider()
-        st.header("📂 药品说明书库")
-        files = st.file_uploader("上传 PDF 说明书", type="pdf", accept_multiple_files=True)
+        st.header("📂 药品库")
+        files = st.file_uploader("上传 PDF", type="pdf", accept_multiple_files=True)
         
         c1, c2 = st.columns(2)
-        if files and c1.button("✨ 同步"):
-            with st.spinner("处理中..."):
+        if files and c1.button("✨ 同步知识"):
+            with st.spinner("解析中..."):
                 for f in files:
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                         tmp.write(f.getvalue())
                         km.upload_docs(tmp.name, f.name)
                     os.unlink(tmp.name)
-                st.success("同步完成！")
+                st.success("同步成功")
                 st.rerun()
+        
         if c2.button("🗑️ 清空库"):
             km.clear_db()
             st.rerun()
 
-        doc_list = km.get_stats()
-        if doc_list:
-            st.info(f"库中已有 {len(doc_list)} 份文件")
-            for d in doc_list: st.caption(f"· {d}")
+        sources = km.get_stats()
+        if sources:
+            st.info(f"已加载 {len(sources)} 份说明书")
+            for s in sources: st.caption(f"· {s}")
 
     # --- 主界面 ---
-    if not st.session_state['api_key']:
-        st.info("请先在左侧配置 API Key。")
-        st.stop()
-    
-    agent = PharmacyAgent(st.session_state['api_key'])
-
     st.title("🏥 药剂科 AI 处方审核平台")
-    st.markdown("---")
+    
+    if not api_key:
+        st.info("请先在左侧侧边栏配置 API Key 以启用 AI。")
+        st.stop()
 
-    col_form, col_result = st.columns([1, 1.3])
+    agent = PharmacyAgent(api_key)
+    
+    col_l, col_r = st.columns([1, 1.3])
 
-    # --- 左侧：录入处方 ---
-    with col_form:
-        st.subheader("📋 录入处方信息")
-        with st.form("prescription_form"):
+    with col_l:
+        st.subheader("📋 录入处方")
+        with st.form("p_form"):
             r1 = st.columns(2)
-            age = r1[0].number_input("年龄", value=25, min_value=0)
+            age = r1[0].number_input("年龄", value=25)
             weight = r1[1].number_input("体重 (kg)", value=60.0) if age < 18 else None
-            if age >= 18: r1[1].info("成人无需输入体重")
             
-            r2 = st.columns(2)
-            diagnosis = r2[0].text_input("临床诊断", value="急性支气管炎")
-            insurance = r2[1].selectbox("医保类型", ["统筹医保", "自费", "门诊大病"])
+            diag = st.text_input("临床诊断", value="急性支气管炎")
+            insu = st.selectbox("医保类型", ["统筹医保", "自费", "门诊大病"])
             
             st.divider()
-            med_name = st.text_input("药品名称", value="来那度胺")
-            dosage = st.text_input("单次剂量", value="25mg")
-            freq = st.text_input("给药频次", value="一日一次")
+            med = st.text_input("药品名称", value="二甲双胍")
+            dose = st.text_input("单次剂量", value="0.5g")
+            freq = st.text_input("给药频次", value="一日两次")
             
-            if st.form_submit_button("🧪 提交 AI 审核"):
-                # 构造数据
-                prescription = {
-                    "patient": {"age": age, "weight": weight, "diagnosis": diagnosis, "insurance": insurance},
-                    "medication": {"name": med_name, "dosage": dosage, "frequency": freq}
-                }
-                
-                with st.spinner("AI 正在查阅说明书并审核..."):
-                    context = km.retrieve_context(med_name)
-                    raw_report = agent.audit(prescription, context)
-                    
-                    # 更新状态
-                    st.session_state['audit_report'] = raw_report
-                    st.session_state['audit_score'] = extract_score(raw_report)
+            if st.form_submit_button("🧪 提交审核"):
+                with st.spinner("AI 正在分析..."):
+                    context = km.retrieve_context(med)
+                    p_data = {
+                        "patient": {"age": age, "weight": weight, "diagnosis": diag, "insurance": insu},
+                        "medication": {"name": med, "dosage": dose, "frequency": freq}
+                    }
+                    report = agent.audit(p_data, context)
+                    st.session_state['audit_report'] = report
+                    st.session_state['audit_score'] = extract_score(report)
                     st.rerun()
 
-    # --- 右侧：审核报告与评分 ---
-    with col_result:
+    with col_r:
         st.subheader("📝 审核报告")
-        
         if st.session_state['audit_report']:
-            # 1. 显示打分
             score = st.session_state['audit_score']
             if score is not None:
-                color = "normal" if score >= 80 else "inverse" # 颜色反馈
-                st.metric(label="处方安全评估得分", value=f"{score} / 100", delta=f"{'安全' if score>=80 else '高风险'}")
-                if score < 60:
-                    st.error("⚠️ 该处方存在重大安全隐患，建议药师人工介入！")
-                elif score < 80:
-                    st.warning("💡 该处方存在部分瑕疵或风险，请仔细复核。")
-                else:
-                    st.success("✅ 该处方初步评估为安全。")
-
-            # 2. 显示可编辑的报告
-            st.markdown("#### AI 生成意见 (点击下方框内可手动修改):")
-            # 用户可以在这里直接修改报告
-            edited_report = st.text_area(
-                label="审核详情编辑器",
-                value=st.session_state['audit_report'],
-                height=450,
-                label_visibility="collapsed"
-            )
+                st.metric("安全评分", f"{score}/100")
             
-            # 同步修改到 session_state
-            st.session_state['audit_report'] = edited_report
-
-            # 3. 导出功能
-            st.divider()
-            c1, c2 = st.columns(2)
-            c1.download_button(
-                label="📥 导出最终报告 (含人工修改)",
-                data=st.session_state['audit_report'],
-                file_name=f"审核报告_{datetime.now().strftime('%Y%m%d%H%M')}.txt",
-                mime="text/plain"
-            )
-            if c2.button("🔄 重新生成结果"):
-                st.session_state['audit_report'] = ""
-                st.rerun()
+            # 可编辑区域
+            edited = st.text_area("编辑报告内容", value=st.session_state['audit_report'], height=450)
+            st.session_state['audit_report'] = edited
+            
+            st.download_button("📥 导出报告", edited, file_name=f"审核报告_{med}.txt")
         else:
-            st.info("尚未提交审核，请在左侧填写处方信息。")
+            st.info("尚未生成结果。")
 
 if __name__ == "__main__":
     main()
